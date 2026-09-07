@@ -34,6 +34,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8080;
 const MIN_GAP = (Number(process.env.MIN_SEND_GAP_SECONDS) || 8) * 1000;
 const PASSWORD = process.env.DASHBOARD_PASSWORD || "";
+// Quanto tempo depois de enviada (ou de falhar/ser cancelada) uma mensagem
+// fica guardada no histórico antes de ser apagada. Sem esse limite o
+// messages.json só cresce (cada mensagem guarda a imagem em base64 pra
+// sempre) até lotar o disco — foi o que já derrubou o app uma vez (ENOSPC).
+const MESSAGE_RETENTION_MS = (Number(process.env.MESSAGE_RETENTION_HOURS) || 8) * 60 * 60 * 1000;
 
 const app = express();
 // Limite maior para aceitar imagens coladas (base64) no corpo do POST.
@@ -148,9 +153,28 @@ async function tick() {
   }
 }
 
+/**
+ * Limpa do histórico as mensagens já enviadas/com falha/canceladas há mais de
+ * MESSAGE_RETENTION_MS (padrão 8h). Roda ao subir e depois periodicamente,
+ * para o messages.json não voltar a crescer sem limite e lotar o disco.
+ */
+function pruneOldMessages() {
+  try {
+    const removed = store.pruneOld(MESSAGE_RETENTION_MS);
+    if (removed) {
+      const hours = (MESSAGE_RETENTION_MS / 3600000).toFixed(1);
+      console.log(`🧹 ${removed} mensagem(ns) com mais de ${hours}h removida(s) do histórico.`);
+    }
+  } catch (e) {
+    console.error("Erro ao limpar mensagens antigas:", e.message);
+  }
+}
+
 // ---- Boot ----
 wa.start().catch((e) => console.error("Erro ao iniciar o WhatsApp:", e));
 setInterval(tick, 5000);
+pruneOldMessages(); // já limpa uma vez ao subir, sem esperar o primeiro intervalo
+setInterval(pruneOldMessages, 10 * 60 * 1000); // depois, a cada 10 minutos
 app.listen(PORT, () => {
   console.log(`🚀 Painel em http://localhost:${PORT}`);
   console.log("Abra o painel e escaneie o QR para conectar o WhatsApp.");
