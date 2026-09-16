@@ -7,10 +7,11 @@ let listTab = "pending"; // aba ativa em Mensagens: pending | sent
 let pastedImage = null; // data URL da imagem colada (reserva)
 let thumbTimer = null;
 let lastThumb = null; // thumb do link do produto (prioridade)
+let editingId = null; // id da mensagem em edição (null = agendando uma nova)
 
 function toast(m) { const t = $("toast"); t.textContent = m; t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 2200); }
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-function waFormat(t) { let h = esc(t); h = h.replace(/\*([^*\n]+)\*/g, "<strong>$1</strong>"); h = h.replace(/~([^~\n]+)~/g, "<del>$1</del>"); h = h.replace(/(^|[\s(])_([^_\n]+)_/g, "$1<em>$2</em>"); return h; }
+function waFormat(t) { let h = esc(t); h = h.replace(/\*([^*\n]+)\*/g, "<strong>$1</strong>"); h = h.replace(/~([^}\n]+)~/g, "<del>$1</del>"); h = h.replace(/(^|[\s(])_([^_\n]+)_/g, "$1<em>$2</em>"); return h; }
 function nowTime() { return new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }); }
 function firstUrl(t) { const m = (t || "").match(/https?:\/\/[^\s]+/); return m ? m[0].replace(/[)\].,]+$/, "") : null; }
 async function api(path, opts) {
@@ -108,7 +109,10 @@ async function fetchThumbForPreview() {
 	updatePreview();
 }
 
-// ---- Agendar ----
+// ---- Agendar / editar ----
+// O mesmo formulário serve para criar uma mensagem nova (qualquer tipo: bom
+// dia, cupom, aviso, com ou sem link — link nunca é obrigatório) e para
+// corrigir uma já agendada, sem precisar excluir e reescrever do zero.
 $("btn-schedule").addEventListener("click", async () => {
 	$("sched-msg").textContent = "";
 	try {
@@ -119,17 +123,49 @@ $("btn-schedule").addEventListener("click", async () => {
 		const text = $("text").value.trim();
 		const dt = $("scheduledAt").value;
 		if (!groupJid) throw new Error("Escolha o grupo.");
-		if (!text && !pastedImage) throw new Error("Escreva a mensagem ou cole uma imagem.");
+		if (!text && !pastedImage && !lastThumb) throw new Error("Escreva a mensagem ou cole uma imagem.");
 		if (!dt) throw new Error("Escolha a data e hora.");
 		const scheduledAt = new Date(dt).getTime();
-		await api("/api/messages", { method: "POST", body: JSON.stringify({ text, imageData: pastedImage, groupJid, groupName, scheduledAt }) });
-		$("text").value = ""; $("scheduledAt").value = ""; setPastedImage(null); lastThumb = null; updatePreview();
-		toast("Mensagem agendada! 📅");
+		const body = JSON.stringify({ text, imageData: pastedImage, groupJid, groupName, scheduledAt });
+		if (editingId) {
+			await api(`/api/messages/${editingId}`, { method: "PUT", body });
+			toast("Edição salva! 💾");
+		} else {
+			await api("/api/messages", { method: "POST", body });
+			toast("Mensagem agendada! 📅");
+		}
+		cancelEdit();
 		loadList();
 	} catch (e) {
 		$("sched-msg").innerHTML = `<span style="color:var(--danger)">${esc(e.message)}</span>`;
 	}
 });
+
+/** Carrega uma mensagem existente no formulário para corrigir algo nela. */
+function editMsg(m) {
+	editingId = m.id;
+	if (groupsLoaded) $("group").value = m.groupJid;
+	$("text").value = m.text || "";
+	setPastedImage(m.imageData || null);
+	lastThumb = m.imageUrl || null;
+	const d = new Date(m.scheduledAt);
+	const pad = (n) => String(n).padStart(2, "0");
+	$("scheduledAt").value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+	$("btn-schedule").textContent = "💾 Salvar edição";
+	$("btn-cancel-edit").hidden = false;
+	$("sched-msg").textContent = "";
+	updatePreview();
+	$("schedule-card").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function cancelEdit() {
+	editingId = null;
+	$("text").value = ""; $("scheduledAt").value = ""; setPastedImage(null); lastThumb = null; updatePreview();
+	$("btn-schedule").textContent = "📅 Agendar disparo";
+	$("btn-cancel-edit").hidden = true;
+	$("sched-msg").textContent = "";
+}
+$("btn-cancel-edit").addEventListener("click", cancelEdit);
 
 // ---- Lista (abas Agendadas / Enviadas) ----
 $("btn-refresh").addEventListener("click", loadList);
@@ -164,15 +200,19 @@ function renderMsg(m) {
 	const when = new Date(m.scheduledAt).toLocaleString("pt-BR");
 	const sentWhen = m.sentAt ? new Date(m.sentAt).toLocaleString("pt-BR") : null;
 	const hasImg = m.imageData || m.imageUrl || firstUrl(m.text);
+	const retrying = m.status === "pending" && m.retries > 0;
 	div.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
 			<strong>${esc(m.groupName)}</strong>
 			<span class="pill ${m.status}">${statusLabel(m.status)}</span>
 		</div>
-		<div class="meta">${sentWhen ? `<span>📤 Enviada: ${sentWhen}</span>` : `<span>🕒 ${when}</span>`}${hasImg ? "<span>🖼️ com imagem</span>" : ""}${m.error ? `<span style="color:var(--danger)">${esc(m.error)}</span>` : ""}</div>
+		<div class="meta">${sentWhen ? `<span>📤 Enviada: ${sentWhen}</span>` : `<span>🕒 ${when}</span>`}${hasImg ? "<span>🖼️ com imagem</span>" : ""}${retrying ? `<span>🔁 tentativa ${m.retries}/3</span>` : ""}${m.error ? `<span style="color:var(--danger)">${esc(m.error)}</span>` : ""}</div>
 		<pre>${waFormat(m.text || "(somente imagem)")}</pre>`;
 	const actions = document.createElement("div");
 	actions.className = "actions";
-	if (m.status === "pending" || m.status === "failed") actions.appendChild(mkBtn("Enviar agora", "ghost small", () => sendNow(m.id)));
+	if (m.status === "pending" || m.status === "failed") {
+		actions.appendChild(mkBtn("✏️ Editar", "ghost small", () => editMsg(m)));
+		actions.appendChild(mkBtn("Enviar agora", "ghost small", () => sendNow(m.id)));
+	}
 	actions.appendChild(mkBtn("Excluir", "danger small", () => remove(m.id)));
 	div.appendChild(actions);
 	return div;
@@ -186,6 +226,7 @@ async function sendNow(id) {
 async function remove(id) {
 	if (!confirm("Excluir esta mensagem?")) return;
 	await api(`/api/messages/${id}`, { method: "DELETE" });
+	if (editingId === id) cancelEdit();
 	toast("Excluída"); loadList();
 }
 
