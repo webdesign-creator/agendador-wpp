@@ -2,7 +2,7 @@
  * Servidor do agendador de WhatsApp.
  *
  * - Serve o painel (public/index.html)
- * - API para status/QR, grupos, agendar, listar e cancelar
+ * - API para status/QR, grupos, agendar, editar, listar e cancelar
  * - Agendador (loop) que dispara as mensagens vencidas no grupo escolhido,
  *   com intervalo mínimo entre envios (para não parecer spam)
  *
@@ -39,6 +39,13 @@ const PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 // messages.json só cresce (cada mensagem guarda a imagem em base64 pra
 // sempre) até lotar o disco — foi o que já derrubou o app uma vez (ENOSPC).
 const MESSAGE_RETENTION_MS = (Number(process.env.MESSAGE_RETENTION_HOURS) || 8) * 60 * 60 * 1000;
+// Falhas de envio costumam ser transitórias (rede, sessão reconectando etc.),
+// não um problema da mensagem em si — inclusive mensagens sem link e sem
+// imagem, que são perfeitamente válidas. Por isso, em vej de marcar como
+// "failed" na primeira falha (o que parecia "a mensagem sumiu" pro usuário),
+// tentamos de novo automaticamente algumas vezes antes de desistir.
+const MAX_SEND_RETRIES = Number(process.env.MAX_SEND_RETRIES) || 3;
+const RETRY_DELAY_MS = (Number(process.env.RETRY_DELAY_MINUTES) || 2) * 60 * 1000;
 
 const app = express();
 // Limite maior para aceitar imagens coladas (base64) no corpo do POST.
@@ -86,8 +93,51 @@ app.post("/api/messages", (req, res) => {
     if (!text && !imageUrl && !imageData) throw new Error("A mensagem não pode ser vazia.");
     const when = Number(scheduledAt);
     if (!when || !isFinite(when)) throw new Error("Data/hora de agendamento inválida.");
+    // Nenhum tipo de mensagem é obrigatório ter link: bom dia, cupom, aviso ou
+    // qualquer outro texto livre agenda e envia normalmente, com ou sem imagem.
     const rec = store.add({ text, imageUrl, imageData, groupJid, groupName, scheduledAt: when });
     res.status(201).json(rec);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/**
+ * Edita uma mensagem ainda não enviada (agendada ou que falhou), sem precisar
+ * excluir e recriar. Volta o status para "pending" (limpando erro/tentativas
+ * anteriores), para que a versão corrigida entre na fila normalmente.
+ */
+app.put("/api/messages/:id", (req, res) => {
+  try {
+    const existing = store.get(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Mensagem não encontrada." });
+    if (existing.status === "sent") throw new Error("Mensagens já enviadas não podem ser editadas.");
+
+    const { text, imageUrl, imageData, groupJid, groupName, scheduledAt } = req.body || {};
+    const patch = {
+      text: text ?? existing.text,
+      imageUrl: imageUrl ?? existing.imageUrl,
+      imageData: imageData ?? existing.imageData,
+      groupJid: groupJid || existing.groupJid,
+      groupName: groupName || existing.groupName,
+    };
+    if (!patch.groupJid) throw new Error("Escolha o grupo de destino.");
+    if (!patch.text && !patch.imageUrl && !patch.imageData) throw new Error("A mensagem não pode ser vazia.");
+
+    if (scheduledAt !== undefined) {
+      const when = Number(scheduledAt);
+      if (!when || !isFinite(when)) throw new Error("Data/hora de agendamento inválida.");
+      patch.scheduledAt = when;
+    }
+
+    // Reagenda como pendente: uma correção deve poder ser reenviada mesmo que
+    // a versão anterior tivesse falhado.
+    patch.status = "pending";
+    patch.error = null;
+    patch.retries = 0;
+
+    const rec = store.update(existing.id, patch);
+    res.json(rec);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -114,7 +164,7 @@ app.delete("/api/messages/:id", (req, res) => {
   res.status(ok ? 200 : 404).json({ ok });
 });
 
-// Enviar agora (teste manual)
+// Enviar agora (teste manual) — tentativa única e imediata, sem reagendar.
 app.post("/api/messages/:id/send-now", async (req, res) => {
   const msg = store.list().find((m) => m.id === req.params.id);
   if (!msg) return res.status(404).json({ error: "Mensagem não encontrada." });
@@ -148,8 +198,18 @@ async function tick() {
     lastSentAt = Date.now();
     console.log(`📤 Enviada para ${msg.groupName}: ${(msg.text || "").slice(0, 40)}…`);
   } catch (e) {
-    store.update(msg.id, { status: "failed", error: e.message });
-    console.error("Falha ao enviar:", e.message);
+    // Falha ao enviar nem sempre é definitiva (conexão reconectando, rede
+    // instável etc.) — isso valia tanto pra mensagem com link quanto sem.
+    // Em vez de desistir na primeira falha, tenta de novo mais algumas vezes
+    // antes de marcar como "failed" de verdade.
+    const retries = (msg.retries || 0) + 1;
+    if (retries < MAX_SEND_RETRIES) {
+      store.update(msg.id, { retries, error: e.message, scheduledAt: Date.now() + RETRY_DELAY_MS });
+      console.warn(`⚠️ Falha ao enviar (tentativa ${retries}/${MAX_SEND_RETRIES}), tentando de novo em breve:`, e.message);
+    } else {
+      store.update(msg.id, { status: "failed", retries, error: e.message });
+      console.error("Falha ao enviar (esgotou as tentativas):", e.message);
+    }
   }
 }
 
